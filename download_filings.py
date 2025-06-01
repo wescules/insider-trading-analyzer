@@ -9,11 +9,29 @@ import sqlite3
 import requests
 import io
 from sec_edgar_downloader import Downloader
+import csv
 
 # Use relative path for data directory
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 DB_PATH = os.path.join(DATA_DIR, 'insider_trading.db')
 SP500_URL = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+SMALL_CAP_COMPANIES = os.path.join(DATA_DIR, "small_cap_companies.csv")
+
+def get_small_cap_companies():
+    """Fetch the list of small, micro and nano cap companies"""
+    # Read the CSV into a DataFrame
+    df = pd.read_csv(SMALL_CAP_COMPANIES)
+    
+    # Extract the ticker symbols (assuming the column is named 'Symbol')
+    if 'Symbol' in df.columns:
+        # Clean the ticker symbols (remove any special characters like dots)
+        tickers = [ticker.replace('.', '-') for ticker in df['Symbol'].tolist()]
+        print(f"Successfully fetched {len(tickers)} S&P 500 companies")
+        return tickers
+    else:
+        print(f"Column 'Symbol' not found in CSV. Available columns: {df.columns.tolist()}")
+        # Return a default list as fallback
+        return ["AAPL", "MSFT", "AMZN", "GOOGL", "META"]
 
 def get_sp500_companies():
     """Fetch the list of S&P 500 companies from GitHub."""
@@ -104,11 +122,11 @@ def main():
                     traceback.print_exc()
                 return 1
         else:
-            # Default to last 3 years if no date range specified
+            # Default to last 1 years if no date range specified
             end_date = datetime.now().strftime("%Y-%m-%d")  # Today
-            start_date = (datetime.now() - timedelta(weeks=156)).strftime("%Y-%m-%d")  # 3 years ago
+            start_date = (datetime.now() - timedelta(weeks=52)).strftime("%Y-%m-%d")  # 1 year ago
             if debug:
-                print(f"DEBUG: Using default date range (last 3 years): {start_date} to {end_date}")
+                print(f"DEBUG: Using default date range (last  year): {start_date} to {end_date}")
                 
         print(f"Using sec-edgar-downloader to fetch Form 4 filings from {start_date} to {end_date}...")
         
@@ -134,7 +152,7 @@ def main():
         # Get S&P 500 companies dynamically
         try:
             # companies = get_sp500_companies()
-            companies = ["META"]
+            companies = get_small_cap_companies()
             if debug:
                 print(f"DEBUG: Successfully fetched companies: {len(companies)}")
                 print(f"DEBUG: First 5 companies: {companies[:5]}")
