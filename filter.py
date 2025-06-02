@@ -27,7 +27,7 @@ def cluster_buys_query(min_insiders=2, window_days=5, transaction_type='P'):
         AND (f1.aff10b5One IS NULL OR f1.aff10b5One = '' OR f1.aff10b5One = 'false' OR f1.aff10b5One = '0')
         GROUP BY f1.issuer_ticker, f1.transaction_date
         HAVING insider_count >= ?
-        ORDER BY insider_count;
+        ORDER BY insider_count ASC;
         """
     return query, (transaction_type, transaction_type, window_days, min_insiders)
 
@@ -90,6 +90,6 @@ def find_cluster_buys():
         print(f"Ticker: https://finviz.com/quote.ashx?t={row[0]}, Date: {row[1]}, Insiders: {row[2]}, Shares: {row[3]}, Value: ${row[4]}")
 
 if __name__ == "__main__":
-    # find_cluster_buys()
+    find_cluster_buys()
     # find_large_purchases()
-    find_repeated_buyer_purchases()
+    # find_repeated_buyer_purchases()
