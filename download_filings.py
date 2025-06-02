@@ -1,21 +1,38 @@
-from datetime import datetime, timedelta
-import argparse  # for --no download option command line argument
-import pandas as pd
-import os
 import glob
-import xml.etree.ElementTree as ET
-import json
-import sqlite3
-import requests
+import os
+import re
 import io
-from sec_edgar_downloader import Downloader
-import csv
+import argparse  # for --no download option command line argument
+from datetime import datetime, timedelta
+from urllib.parse import urlparse
+import asyncio
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+import sqlite3
+
+from sec_downloader import Downloader
+from sec_downloader.types import RequestedFilings
+import aiohttp
+from tqdm import tqdm
+import pandas as pd
+import requests
+
+dl = Downloader("MyCompanyName", "email@example.com")
+
+semaphore = asyncio.Semaphore(5)  # SEC limits to 10 requests/sec but this should slow it down to not hit rate limit
 
 # Use relative path for data directory
+FORM4_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'form4data')
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 DB_PATH = os.path.join(DATA_DIR, 'insider_trading.db')
-SP500_URL = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+URL_PATH = os.path.join(DATA_DIR, 'url.txt')
 SMALL_CAP_COMPANIES = os.path.join(DATA_DIR, "small_cap_companies.csv")
+
+SP500_URL = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+
+MAX_FILING_DAYS = 365  # Only get filings < 1 year ago by default
+MAX_FILING_LIMIT = 5000
+ALL_FILENAMES = set()
 
 def get_small_cap_companies():
     """Fetch the list of small, micro and nano cap companies"""
@@ -61,243 +78,64 @@ def get_sp500_companies():
         # Return a default list as fallback
         return ["AAPL", "MSFT", "AMZN", "GOOGL", "META"]
 
-def main():
-    """Main function to download Form 4 filings."""
-    # Create an argument parser
-    parser = argparse.ArgumentParser(description='Process SEC Form 4 filings.')
-    parser.add_argument('--no-download', action='store_true', 
-                        help='Skip downloading new filings and only process existing files')
-    parser.add_argument('--limit', type=int, default=0,
-                        help='Limit the number of S&P 500 companies to download (0 = all)')
-    parser.add_argument('--date-range', type=str, 
-                        help='Date range for downloading filings in format YYYY-MM-DD:YYYY-MM-DD')
-    parser.add_argument('--debug', action='store_true', default=True,
-                        help='Enable debug output')
-    args = parser.parse_args()
-    
-    # Enable debug output for GitHub Actions
-    debug = args.debug or ('GITHUB_ACTIONS' in os.environ)
-    
-    if debug:
-        print("DEBUG: Starting InsiderTrading.py script")
-        print(f"DEBUG: Current working directory: {os.getcwd()}")
-        print(f"DEBUG: Data directory: {DATA_DIR}")
-        print(f"DEBUG: Database path: {DB_PATH}")
-        print(f"DEBUG: No-download mode: {args.no_download}")
-        print(f"DEBUG: Company limit: {args.limit}")
-    
-    # Create data directory if it doesn't exist
-    os.makedirs(DATA_DIR, exist_ok=True)
-    
-    if debug:
-        print("DEBUG: Data directory created or verified")
-        print("DEBUG: Listing files in data directory:")
-        for root, dirs, files in os.walk(DATA_DIR):
-            print(f"DEBUG:   Dir: {root}")
-            for file in files:
-                print(f"DEBUG:     File: {file}")
-    
-    # Initialize SQLite database
-    initialize_database()
-    
-    if debug:
-        print("DEBUG: Database initialized")
-    
-    if not args.no_download:
-        # Only run download code if --no-download is NOT specified
-        # Define date range for Form 4 filings
-        if args.date_range:
-            # Parse the date range from the argument (format: YYYY-MM-DD:YYYY-MM-DD)
-            try:
-                start_date, end_date = args.date_range.split(':')
-                # Validate dates
-                datetime.strptime(start_date, "%Y-%m-%d")
-                datetime.strptime(end_date, "%Y-%m-%d")
-                if debug:
-                    print(f"DEBUG: Using custom date range: {start_date} to {end_date}")
-            except ValueError as e:
-                print(f"ERROR: Invalid date range format. Use YYYY-MM-DD:YYYY-MM-DD. Error: {e}")
-                if debug:
-                    import traceback
-                    traceback.print_exc()
-                return 1
-        else:
-            # Default to last 1 years if no date range specified
-            end_date = datetime.now().strftime("%Y-%m-%d")  # Today
-            start_date = (datetime.now() - timedelta(weeks=52)).strftime("%Y-%m-%d")  # 1 year ago
-            if debug:
-                print(f"DEBUG: Using default date range (last  year): {start_date} to {end_date}")
-                
-        print(f"Using sec-edgar-downloader to fetch Form 4 filings from {start_date} to {end_date}...")
-        
-        # Initialize the downloader with company name and user email (required by SEC)
-        company_name = "S&P500 Insider Trading Research Project"
-        user_email = "wescules@yahoo.com"  # Using a real email for SEC requirements
-        if debug:
-            print(f"DEBUG: Using company name: {company_name}")
-            print(f"DEBUG: Using email: {user_email}")
-        
-        try:
-            # The library will automatically create headers using company_name and user_email
-            dl = Downloader(company_name, user_email, DATA_DIR)
-            if debug:
-                print("DEBUG: Downloader initialized successfully")
-        except Exception as e:
-            print(f"ERROR: Failed to initialize downloader: {e}")
-            if debug:
-                import traceback
-                traceback.print_exc()
-            return 1
-        
-        # Get S&P 500 companies dynamically
-        try:
-            # companies = get_sp500_companies()
-            companies = get_small_cap_companies()
-            if debug:
-                print(f"DEBUG: Successfully fetched companies: {len(companies)}")
-                print(f"DEBUG: First 5 companies: {companies[:5]}")
-        except Exception as e:
-            print(f"ERROR: Failed to get S&P 500 companies: {e}")
-            if debug:
-                import traceback
-                traceback.print_exc()
-            return 1
-        
-        # Apply limit if specified
-        if args.limit > 0 and args.limit < len(companies):
-            print(f"Limiting to the first {args.limit} companies (out of {len(companies)} total S&P 500 companies)")
-            companies = companies[:args.limit]
-            if debug:
-                print(f"DEBUG: Limited to companies: {companies}")
-        else:
-            print(f"Processing all {len(companies)} S&P 500 companies")
-        
-        # Download Form 4 filings for each company
-        for i, ticker in enumerate(companies):
-            try:
-                print(f"[{i+1}/{len(companies)}] Downloading Form 4 filings for {ticker}...")
-                if debug:
-                    print(f"DEBUG: Starting download for {ticker}")
-                
-                # Download Form 4 filings within the specified date range
-                # Set download_details=True to get the XML files
-                dl.get("4", ticker, after=start_date, before=end_date, download_details=True)
-                print(f"Successfully downloaded Form 4 filings for {ticker}")
-            except Exception as e:
-                print(f"Error downloading Form 4 filings for {ticker}: {e}")
-                if debug:
-                    import traceback
-                    traceback.print_exc()
-    else:
-        print("Skipping download, processing existing files only...")
-        if debug:
-            print("DEBUG: No-download mode, checking for existing files:")
-            # List files
-            for root, dirs, files in os.walk(os.path.join(DATA_DIR, "sec-edgar-filings")):
-                print(f"DEBUG:   Dir: {root}")
-                for file in files:
-                    print(f"DEBUG:     File: {file}")
-    
-    # Process the downloaded Form 4 filings
+HEADERS = {
+    "User-Agent": "MyCompanyName (email@example.com)",
+    "Accept-Encoding": "gzip, deflate",
+    "Host": "www.sec.gov"
+}
+
+def is_valid_url(url):
+    parsed = urlparse(url)
+    return all([parsed.scheme, parsed.netloc])
+
+def sanitize_filename(name):
+    return re.sub(r'[\\/*?:"<>|]', "", name)
+
+# Extract company name from XML
+def get_company_name_from_xml(content):
     try:
-        if debug:
-            print("DEBUG: Starting to process Form 4 filings")
-        process_form4_filings()
-        if debug:
-            print("DEBUG: Successfully processed Form 4 filings")
-    except Exception as e:
-        print(f"ERROR: Failed to process Form 4 filings: {e}")
-        if debug:
-            import traceback
-            traceback.print_exc()
-        return 1
-    
-    if debug:
-        print("DEBUG: Script completed successfully")
-    
-    return 0
+        root = ET.fromstring(content)
+        issuer = root.find(".//issuer")
+        if issuer is not None:
+            name_tag = issuer.find("issuerTradingSymbol")
+            if name_tag is not None:
+                return sanitize_filename(name_tag.text)
+    except Exception:
+        pass
+    return "Unknown"
 
-def initialize_database():
-    """Initialize SQLite database with the required tables."""
-    print("Initializing SQLite database...")
-    
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    # Create main insider trading table
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS insider_trading (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        issuer_name TEXT,
-        issuer_ticker TEXT,
-        reporting_owner TEXT,
-        reporting_owner_cik TEXT,
-        reporting_owner_position TEXT,
-        transaction_date TEXT,
-        transaction_shares TEXT,
-        transaction_price TEXT,
-        transaction_type TEXT,
-        shares_after_transaction TEXT,
-        aff10b5One TEXT,
-        source_file TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    ''')
-    
-    # Create index for faster queries
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_issuer_ticker ON insider_trading (issuer_ticker)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_transaction_date ON insider_trading (transaction_date)')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_reporting_owner ON insider_trading (reporting_owner)')
-    
-    conn.commit()
-    conn.close()
-    
-    print("Database initialized successfully")
-
-def check_downloaded_data():
-    """Examines the downloaded data structure and prints information about it."""
-    print("\nChecking downloaded data structure:")
-    
-    # List directories and files
-    if not os.path.exists(DATA_DIR):
-        print(f"Error: Directory {DATA_DIR} does not exist")
+async def download_and_save_xml(session, url):
+    filename = url.replace("https://www.sec.gov/Archives/edgar/data/", "")
+    filename = filename.replace('/', '-')
+    if filename in ALL_FILENAMES:
+        print("Skipping download. Already have a local copy")
         return
-    
-    # Count files 
-    print(f"\nDirectory structure:")
-    for root, dirs, files in os.walk(DATA_DIR):
-        depth = root.replace(DATA_DIR, '').count(os.sep)
-        indent = ' ' * 4 * depth
-        print(f"{indent}{os.path.basename(root)}/")
-        if depth < 2:  # Only show files for the first two levels
-            for file in files:
-                print(f"{indent}    {file}")
-    
-    # Find XML files
-    xml_files = glob.glob(f"{DATA_DIR}/**/*.xml", recursive=True)
-    print(f"\nFound {len(xml_files)} XML files")
-    
-    # Examine a sample XML file if available
-    if xml_files:
-        sample_file = xml_files[0]
-        print(f"\nExamining sample XML file: {os.path.basename(sample_file)}")
-        try:
-            tree = ET.parse(sample_file)
-            root = tree.getroot()
-            print(f"Root tag: {root.tag}")
-            print(f"Namespace: {root.attrib}")
-            print("\nChild elements:")
-            for child in list(root)[:5]:  # Print first 5 children
-                print(f"  {child.tag}")
-        except Exception as e:
-            print(f"Error parsing XML: {e}")
+    async with semaphore:  # Enforce max 10 concurrent requests
+        async with session.get(url, headers=HEADERS) as resp:
+            if resp.status == 200:
+                content = await resp.read()
+                company_name = get_company_name_from_xml(content)
+                output_dir = os.path.join(FORM4_DATA_DIR, company_name)
+                os.makedirs(output_dir, exist_ok=True)
+                output_path = os.path.join(output_dir, filename)
+                
+                with open(output_path, "wb") as f:
+                    f.write(content)
+            else:
+                print(resp)
+
+async def save_xmls_to_file(xml_urls):
+    async with aiohttp.ClientSession() as session:
+        tasks = [download_and_save_xml(session, url) for url in xml_urls]
+        for t in tqdm(asyncio.as_completed(tasks), total=len(tasks)):
+            await t
 
 def process_form4_filings():
     """Process the downloaded Form 4 filings to extract insider trading information."""
     print("\nProcessing Form 4 filings...")
     
     # Find all XML files (Form 4 filings are in XML format)
-    xml_files = glob.glob(f"{DATA_DIR}/**/*.xml", recursive=True)
+    xml_files = glob.glob(f"{FORM4_DATA_DIR}/**/*.xml", recursive=True)
     
     if not xml_files:
         print("No XML files found to process")
@@ -311,7 +149,7 @@ def process_form4_filings():
     processed_count = 0
     error_count = 0
     
-    for xml_file in xml_files:
+    for xml_file in tqdm(xml_files):
         try:
             # Parse the XML file
             tree = ET.parse(xml_file)
@@ -436,33 +274,137 @@ def display_sample_data():
     except Exception as e:
         print(f"Error displaying sample data: {e}")
 
-def query_insider_trading(ticker=None, date_from=None, date_to=None, limit=10):
-    """Query insider trading data from the SQLite database."""
+def initialize_database():
+    """Initialize SQLite database with the required tables."""
+    print("Initializing SQLite database...")
+    
     conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
     
-    query = "SELECT * FROM insider_trading WHERE 1=1"
-    params = []
+    # Create main insider trading table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS insider_trading (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        issuer_name TEXT,
+        issuer_ticker TEXT,
+        reporting_owner TEXT,
+        reporting_owner_cik TEXT,
+        reporting_owner_position TEXT,
+        transaction_date TEXT,
+        transaction_shares TEXT,
+        transaction_price TEXT,
+        transaction_type TEXT,
+        shares_after_transaction TEXT,
+        aff10b5One TEXT,
+        source_file TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
     
-    if ticker:
-        query += " AND issuer_ticker = ?"
-        params.append(ticker)
+    # Create index for faster queries
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_issuer_ticker ON insider_trading (issuer_ticker)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_transaction_date ON insider_trading (transaction_date)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_reporting_owner ON insider_trading (reporting_owner)')
     
-    if date_from:
-        query += " AND transaction_date >= ?"
-        params.append(date_from)
-    
-    if date_to:
-        query += " AND transaction_date <= ?"
-        params.append(date_to)
-    
-    query += " ORDER BY transaction_date DESC LIMIT ?"
-    params.append(limit)
-    
-    df = pd.read_sql_query(query, conn, params=params)
+    conn.commit()
     conn.close()
     
-    return df
+    print("Database initialized successfully")
 
+
+
+
+def read_urls_from_file():
+    with open(URL_PATH, 'r') as file:
+        urls = [line.strip() for line in file if line.strip() and is_valid_url(line.strip())]
+        filenames = [url.replace("https://www.sec.gov/Archives/edgar/data/", "").replace('/', '-') for url in urls]
+        ALL_FILENAMES = set(filenames)
+        return urls
+
+def fetch_company_urls(company):
+    try:
+        print(f"Getting metadata for: {company}")
+        metadatas = dl.get_filing_metadatas(
+            RequestedFilings(ticker_or_cik=company, form_type="4", limit=MAX_FILING_LIMIT)
+        )
+        urls = []
+        for metadata in metadatas:
+            report_date = datetime.strptime(metadata.report_date, "%Y-%m-%d").date()
+            one_year_ago = datetime.today().date() - timedelta(days=MAX_FILING_DAYS)
+            is_recent = report_date > one_year_ago
+            if is_recent:
+                urls.append(metadata.primary_doc_url)
+        print(f"Adding {len(urls)} xmls to list for company: {company}")
+        
+        with open(URL_PATH, "a") as f:
+            for url in urls:
+                f.write(url + '\n')
+    except Exception as e:
+        print(f"Error with {company}: {e}")
+        return []
+
+def write_urls_to_file(urls):
+    with open(URL_PATH, "a") as f:
+        for url in urls:
+            f.write(url + '\n')
+
+async def process_company(executor, company):
+    async with semaphore:  # Enforce max 10 concurrent requests
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(executor, fetch_company_urls, company)
+
+async def fetch_and_write_xml_urls_to_file():
+    companies = get_small_cap_companies()
+    open(URL_PATH, "w").close() # Clear the file
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        tasks = [process_company(executor, company) for company in companies]
+        await asyncio.gather(*tasks)
+
+# Entry point
 if __name__ == "__main__":
-    import sys
-    sys.exit(main())
+    """Main function to download Form 4 filings."""
+    # Create an argument parser
+    parser = argparse.ArgumentParser(description='Process SEC Form 4 filings.')
+    parser.add_argument('--skip-download', action='store_true', 
+                        help='Skip downloading new filings and only process existing files')
+    parser.add_argument('--skip-fetch-urls', action='store_true', 
+                        help='Skip fetching URLs and ')
+    parser.add_argument('--date-range', type=str, 
+                        help='Day range for downloading filings in. Enter number of days. Ex: 365')
+    parser.add_argument('--limit', type=int, default=0,
+                        help='Limit the number of S&P 500 companies to download (0 = all)')
+    parser.add_argument('--debug', action='store_true', default=True,
+                        help='Enable debug output')
+    args = parser.parse_args()
+
+    if args.date_range:
+        MAX_FILING_DAYS = args.date_range
+    if args.limit:
+        MAX_FILING_LIMIT = args.limit
+    if not args.skip_download:
+        if not args.skip_fetch_urls:
+            asyncio.run(fetch_and_write_xml_urls_to_file())
+            print("Finished fetching and writing urls, proceeding to read from file...")
+        
+        xml_urls = read_urls_from_file()
+        print("Finished reading file, proceeding to fetch xmls...")
+        asyncio.run(save_xmls_to_file(xml_urls))
+
+    # Initialize SQLite database
+    initialize_database()
+    
+    # Process the downloaded Form 4 filings
+    try:
+        if args.debug:
+            print("DEBUG: Starting to process Form 4 filings")
+        process_form4_filings()
+        if args.debug:
+            print("DEBUG: Successfully processed Form 4 filings")
+    except Exception as e:
+        print(f"ERROR: Failed to process Form 4 filings: {e}")
+        if args.debug:
+            import traceback
+            traceback.print_exc()
+
+    

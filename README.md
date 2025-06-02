@@ -15,7 +15,7 @@ A Python project that downloads Form 4 and Form 144 SEC filings, filters for hig
 ## Getting Started
 ```bash
 pip install -r requirements.txt
-python scripts/extract_filings.py
+python download_filings.py
 python scripts/filters.py --min_buy 100000
 python scripts/backtest.py --days 30
 ```
@@ -51,8 +51,9 @@ Here’s a **project roadmap** for building a professional-grade **Screener + Al
 
 #### Deliverables:
 
-* `extract_filings.py`
+* `download_filings.py`
 * DuckDB database file `insider_data.duckdb`
+
 
 ---
 

@@ -194,4 +194,4 @@ cython_debug/
 .cursorindexingignore
 
 # Ignores all the downloaded files
-data/sec-edgar-filings
+form4data/
